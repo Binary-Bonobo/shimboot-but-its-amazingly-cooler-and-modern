@@ -23,23 +23,38 @@ jobs:
           squashfs-tools unzip cryptsetup lvm2 fdisk gdisk util-linux \
           binwalk pcregrep cpio lz4 pv debootstrap python3
 
-      - name: Download shim and recovery
+      - name: Download shim
         run: |
-          sudo bash << 'EOF'
           mkdir -p data
-          
-          # Download shim via shimboot's own downloader
-          . ./common.sh
-          . ./shim_utils.sh
-          download_shim "" "data/shim_octopus.zip" "data/shim_octopus.bin"
-          
-          # Download R107 recovery
+
+          # Fetch shim via cros.download chunked manifest
+          BOARDS_INDEX=$(curl -s "https://cdn.cros.download/boards.txt")
+          SHIM_MANIFEST_PATH=$(echo "$BOARDS_INDEX" | grep "/octopus/" | head -1).manifest
+          SHIM_MANIFEST=$(curl -s "https://cdn.cros.download/$SHIM_MANIFEST_PATH")
+          SHIM_DIR=$(dirname "$SHIM_MANIFEST_PATH")
+          CHUNKS=$(echo "$SHIM_MANIFEST" | python3 -c "
+          import json, sys
+          m = json.load(sys.stdin)
+          print('\n'.join(m['chunks']))
+          ")
+
+          mkdir -p data/shim_chunks
+          for CHUNK in $CHUNKS; do
+            wget -q "https://cdn.cros.download/$SHIM_DIR/$CHUNK" -O "data/shim_chunks/$CHUNK"
+          done
+          cat data/shim_chunks/* > data/shim_octopus.zip
+          unzip -p data/shim_octopus.zip > data/shim_octopus.bin
+          rm -rf data/shim_chunks data/shim_octopus.zip
+          echo "Shim size: $(du -h data/shim_octopus.bin)"
+
+      - name: Download R107 recovery
+        run: |
           wget -q --show-progress \
             "https://dl.google.com/dl/edgedl/chromeos/recovery/chromeos_15117.86.0_octopus_recovery_stable-channel_mp-v31.bin.zip" \
             -O data/reco_octopus.zip
           unzip -p data/reco_octopus.zip > data/reco_octopus.bin
           rm data/reco_octopus.zip
-          EOF
+          echo "Recovery size: $(du -h data/reco_octopus.bin)"
 
       - name: Build Debian rootfs
         run: |
@@ -56,47 +71,50 @@ jobs:
           sudo ./patch_rootfs.sh data/shim_octopus.bin data/reco_octopus.bin \
             data/rootfs_debian quiet=true
 
-      - name: Extract ChromeOS rootfs
+      - name: Extract ChromeOS rootfs from recovery
         run: |
-          sudo bash << 'EOF'
           set -e
           RECO_BIN="data/reco_octopus.bin"
-          RECO_LOOP=$(losetup -f --show -P "$RECO_BIN")
-          
-          mkdir -p data/rootfs_chromeos
-          mkdir -p /mnt/chromeos_src
-          
+          RECO_LOOP=$(sudo losetup -f --show -P "$RECO_BIN")
+
           # ROOT-A is partition 3
-          mount -o ro ${RECO_LOOP}p3 /mnt/chromeos_src
-          cp -a /mnt/chromeos_src/. data/rootfs_chromeos/
-          umount /mnt/chromeos_src
-          losetup -d $RECO_LOOP
-          EOF
+          sudo mkdir -p /mnt/chromeos_src
+          sudo mount -o ro ${RECO_LOOP}p3 /mnt/chromeos_src
 
-      - name: Build final image with both partitions
+          mkdir -p data/rootfs_chromeos
+          sudo cp -a /mnt/chromeos_src/. data/rootfs_chromeos/
+
+          sudo umount /mnt/chromeos_src
+          sudo losetup -d $RECO_LOOP
+          echo "ChromeOS rootfs size: $(du -sh data/rootfs_chromeos)"
+
+      - name: Build final image (Debian + ChromeOS unenrolled + ChromeOS exam)
         run: |
-          sudo bash << 'EOF'
           set -e
-          . ./common.sh
-          . ./image_utils.sh
-          . ./shim_utils.sh
 
-          # Build image with Debian first
-          ./build.sh data/shimboot_octopus.bin \
+          # Build base image with Debian partition
+          sudo ./build.sh data/shimboot_octopus.bin \
             data/shim_octopus.bin \
             data/rootfs_debian \
             name=debian \
-            arch=amd64 \
-            quiet=true
+            arch=amd64
 
-          # Append ChromeOS partition
-          ./build.sh data/shimboot_octopus.bin \
+          # Add unenrolled ChromeOS partition (with HWID spoof)
+          sudo ./build.sh data/shimboot_octopus.bin \
             data/shim_octopus.bin \
             data/rootfs_chromeos \
             name=chromeos \
-            arch=amd64 \
-            quiet=true
-          EOF
+            arch=amd64
+
+          # Clone ChromeOS rootfs for clean exam partition (no spoof, enrolls normally)
+          sudo cp -a data/rootfs_chromeos data/rootfs_chromeos_exam
+          sudo ./build.sh data/shimboot_octopus.bin \
+            data/shim_octopus.bin \
+            data/rootfs_chromeos_exam \
+            name=chromeos_exam \
+            arch=amd64
+
+          echo "Final image size: $(du -h data/shimboot_octopus.bin)"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
