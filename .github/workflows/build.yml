@@ -20,22 +20,87 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y git wget curl cgpt kpartx dosfstools \
-          squashfs-tools unzip cryptsetup lvm2 fdisk gdisk util-linux
+          squashfs-tools unzip cryptsetup lvm2 fdisk gdisk util-linux \
+          binwalk pcregrep cpio lz4 pv debootstrap python3
 
       - name: Download shim and recovery
         run: |
-          wget -O shim.zip "https://dl.cros.download/files/octopus/octopus.zip"
-          wget -O recovery.zip "https://dl.google.com/dl/edgedl/chromeos/recovery/chromeos_16610.57.0_octopus_recovery_stable-channel_OctopusMPKeys-v38.bin.zip"
-          unzip shim.zip
-          unzip recovery.zip
+          sudo bash << 'EOF'
+          mkdir -p data
+          
+          # Download shim via shimboot's own downloader
+          . ./common.sh
+          . ./shim_utils.sh
+          download_shim "" "data/shim_octopus.zip" "data/shim_octopus.bin"
+          
+          # Download R107 recovery
+          wget -q --show-progress \
+            "https://dl.google.com/dl/edgedl/chromeos/recovery/chromeos_15117.86.0_octopus_recovery_stable-channel_mp-v31.bin.zip" \
+            -O data/reco_octopus.zip
+          unzip -p data/reco_octopus.zip > data/reco_octopus.bin
+          rm data/reco_octopus.zip
+          EOF
 
-      - name: Build
+      - name: Build Debian rootfs
         run: |
-          sudo ./build_complete.sh octopus
+          sudo ./build_rootfs.sh data/rootfs_debian bookworm \
+            hostname=shimboot-octopus \
+            username=user \
+            user_passwd=user \
+            arch=amd64 \
+            distro=debian \
+            quiet=true
+
+      - name: Patch Debian rootfs
+        run: |
+          sudo ./patch_rootfs.sh data/shim_octopus.bin data/reco_octopus.bin \
+            data/rootfs_debian quiet=true
+
+      - name: Extract ChromeOS rootfs
+        run: |
+          sudo bash << 'EOF'
+          set -e
+          RECO_BIN="data/reco_octopus.bin"
+          RECO_LOOP=$(losetup -f --show -P "$RECO_BIN")
+          
+          mkdir -p data/rootfs_chromeos
+          mkdir -p /mnt/chromeos_src
+          
+          # ROOT-A is partition 3
+          mount -o ro ${RECO_LOOP}p3 /mnt/chromeos_src
+          cp -a /mnt/chromeos_src/. data/rootfs_chromeos/
+          umount /mnt/chromeos_src
+          losetup -d $RECO_LOOP
+          EOF
+
+      - name: Build final image with both partitions
+        run: |
+          sudo bash << 'EOF'
+          set -e
+          . ./common.sh
+          . ./image_utils.sh
+          . ./shim_utils.sh
+
+          # Build image with Debian first
+          ./build.sh data/shimboot_octopus.bin \
+            data/shim_octopus.bin \
+            data/rootfs_debian \
+            name=debian \
+            arch=amd64 \
+            quiet=true
+
+          # Append ChromeOS partition
+          ./build.sh data/shimboot_octopus.bin \
+            data/shim_octopus.bin \
+            data/rootfs_chromeos \
+            name=chromeos \
+            arch=amd64 \
+            quiet=true
+          EOF
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: shimboot-octopus
-          path: "*.bin"
+          path: data/shimboot_octopus.bin
           retention-days: 5
