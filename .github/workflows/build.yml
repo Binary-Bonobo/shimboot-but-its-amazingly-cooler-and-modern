@@ -1,0 +1,41 @@
+name: Build Shimboot ChromeOS
+
+on:
+  workflow_dispatch:
+    inputs:
+      board:
+        description: 'Board name'
+        default: 'octopus'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git wget curl cgpt kpartx mkfs.fat \
+          squashfs-tools unzip cryptsetup lvm2 fdisk gdisk
+
+      - name: Download shim and recovery
+        run: |
+          wget -O shim.zip "https://dl.cros.download/files/octopus/octopus.zip"
+          wget -O recovery.zip "https://dl.google.com/dl/edgedl/chromeos/recovery/chromeos_16610.57.0_octopus_recovery_stable-channel_OctopusMPKeys-v38.bin.zip"
+          unzip shim.zip
+          unzip recovery.zip
+
+      - name: Build
+        run: |
+          sudo ./build_complete.sh octopus
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: shimboot-octopus
+          path: "*.bin"
+          retention-days: 5
