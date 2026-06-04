@@ -86,7 +86,6 @@ jobs:
           sudo ./build.sh data/shimboot_octopus.bin \
             data/shim_octopus.bin \
             data/rootfs_debian \
-            name=debian \
             quiet=true
           echo "Base image partition table:"
           sudo cgpt show data/shimboot_octopus.bin
@@ -103,27 +102,18 @@ jobs:
 
             echo "=== Appending partition: $part_name ==="
 
-            # Size of rootfs in sectors (512 bytes each), add 20% headroom
             local rootfs_bytes=$(sudo du -sb "$rootfs_dir" | cut -f1)
             local part_sectors=$(( (rootfs_bytes * 12 / 10 / 512) + 4096 ))
-            # Round up to nearest 2048 (1MB alignment)
             part_sectors=$(( (part_sectors / 2048 + 1) * 2048 ))
 
-            # Find where current disk ends (last sector of last partition)
             local last_end=$(sudo sgdisk -p "$IMAGE" | grep "^ " | awk '{print $3}' | sort -n | tail -1)
             local new_start=$(( last_end + 1 ))
-            # Align start to 2048
             new_start=$(( (new_start / 2048 + 1) * 2048 ))
             local new_end=$(( new_start + part_sectors - 1 ))
 
-            # New total disk size in bytes (new_end + GPT backup + buffer)
-            local new_disk_sectors=$(( new_end + 2048 ))
-            local new_disk_bytes=$(( new_disk_sectors * 512 ))
-
+            local new_disk_bytes=$(( (new_end + 2048) * 512 ))
             echo "Extending image to ${new_disk_bytes} bytes"
             sudo truncate -s "$new_disk_bytes" "$IMAGE"
-
-            # Move GPT backup header to end of newly extended disk
             sudo sgdisk -e "$IMAGE"
 
             echo "Adding partition $part_name: sectors $new_start to $new_end"
@@ -132,20 +122,24 @@ jobs:
               --change-name=0:"shimboot_rootfs:${part_name}" \
               --typecode=0:0FC63DAF-8483-4772-8E79-3D69D8477DE4
 
-            # Get the new partition number
-            local part_num=$(sudo sgdisk -p "$IMAGE" | grep "shimboot_rootfs:${part_name}" | awk '{print $1}')
+            # Use sgdisk -i to find the new partition number reliably
+            # It's always the highest-numbered partition after adding
+            local part_num=$(sudo sgdisk -p "$IMAGE" | grep "^ " | awk '{print $1}' | sort -n | tail -1)
             echo "New partition number: $part_num"
 
-            # Format and populate
             local loop=$(sudo losetup -f --show -P "$IMAGE")
-            echo "Loop: $loop, partition: ${loop}p${part_num}"
-            sleep 1
+            echo "Loop: $loop"
+            # partprobe to make kernel see new partition table
+            sudo partprobe "$loop" 2>/dev/null || true
+            sleep 2
 
-            sudo mkfs.ext4 "${loop}p${part_num}"
+            local part_dev="${loop}p${part_num}"
+            echo "Formatting $part_dev"
+            sudo mkfs.ext4 -L "shimboot_rootfs:${part_name}" "$part_dev"
 
             local mnt="/tmp/new_part_mnt"
             sudo mkdir -p "$mnt"
-            sudo mount "${loop}p${part_num}" "$mnt"
+            sudo mount "$part_dev" "$mnt"
             echo "Copying rootfs..."
             sudo cp -a "$rootfs_dir"/. "$mnt"/
             sudo umount "$mnt"
