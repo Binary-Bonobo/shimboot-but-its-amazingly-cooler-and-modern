@@ -83,8 +83,6 @@ jobs:
 
       - name: Build base image with Debian only
         run: |
-          # build.sh always creates a fresh image - we use it once for Debian
-          # then manually append the ChromeOS partitions afterwards
           sudo ./build.sh data/shimboot_octopus.bin \
             data/shim_octopus.bin \
             data/rootfs_debian \
@@ -99,32 +97,36 @@ jobs:
 
           IMAGE="data/shimboot_octopus.bin"
 
-          # Helper: append a new named rootfs partition to the image
           append_rootfs() {
             local rootfs_dir="$1"
             local part_name="$2"
 
             echo "=== Appending partition: $part_name ==="
 
-            # Calculate size needed (MB), add 20% headroom
-            local rootfs_mb=$(sudo du -sm "$rootfs_dir" | cut -f1)
-            local part_mb=$(( rootfs_mb * 12 / 10 + 5 ))
-            local part_bytes=$(( part_mb * 1024 * 1024 ))
+            # Size of rootfs in sectors (512 bytes each), add 20% headroom
+            local rootfs_bytes=$(sudo du -sb "$rootfs_dir" | cut -f1)
+            local part_sectors=$(( (rootfs_bytes * 12 / 10 / 512) + 4096 ))
+            # Round up to nearest 2048 (1MB alignment)
+            part_sectors=$(( (part_sectors / 2048 + 1) * 2048 ))
 
-            # Get current end of disk
-            local current_sectors=$(sudo sgdisk -p "$IMAGE" | grep "Total free space" | awk '{print $4}')
-            local disk_sectors=$(sudo sgdisk -p "$IMAGE" | grep "Disk" | head -1 | awk '{print $3}')
-
-            # Find last used sector
-            local last_end=$(sudo sgdisk -p "$IMAGE" | grep "^ " | tail -1 | awk '{print $3}')
+            # Find where current disk ends (last sector of last partition)
+            local last_end=$(sudo sgdisk -p "$IMAGE" | grep "^ " | awk '{print $3}' | sort -n | tail -1)
             local new_start=$(( last_end + 1 ))
-            local new_end=$(( new_start + (part_mb * 2048) - 1 ))
+            # Align start to 2048
+            new_start=$(( (new_start / 2048 + 1) * 2048 ))
+            local new_end=$(( new_start + part_sectors - 1 ))
 
-            # Extend image file to fit new partition
-            local new_size_bytes=$(( (new_end + 2048) * 512 ))
-            sudo truncate -s "$new_size_bytes" "$IMAGE"
+            # New total disk size in bytes (new_end + GPT backup + buffer)
+            local new_disk_sectors=$(( new_end + 2048 ))
+            local new_disk_bytes=$(( new_disk_sectors * 512 ))
 
-            # Add new GPT partition
+            echo "Extending image to ${new_disk_bytes} bytes"
+            sudo truncate -s "$new_disk_bytes" "$IMAGE"
+
+            # Move GPT backup header to end of newly extended disk
+            sudo sgdisk -e "$IMAGE"
+
+            echo "Adding partition $part_name: sectors $new_start to $new_end"
             sudo sgdisk "$IMAGE" \
               --new=0:${new_start}:${new_end} \
               --change-name=0:"shimboot_rootfs:${part_name}" \
@@ -134,30 +136,24 @@ jobs:
             local part_num=$(sudo sgdisk -p "$IMAGE" | grep "shimboot_rootfs:${part_name}" | awk '{print $1}')
             echo "New partition number: $part_num"
 
-            # Format and populate via loop device
+            # Format and populate
             local loop=$(sudo losetup -f --show -P "$IMAGE")
-            echo "Loop device: $loop"
-            sudo partprobe "$loop" 2>/dev/null || true
+            echo "Loop: $loop, partition: ${loop}p${part_num}"
             sleep 1
 
-            local part_dev="${loop}p${part_num}"
-            echo "Formatting $part_dev"
-            sudo mkfs.ext4 "$part_dev"
+            sudo mkfs.ext4 "${loop}p${part_num}"
 
             local mnt="/tmp/new_part_mnt"
             sudo mkdir -p "$mnt"
-            sudo mount "$part_dev" "$mnt"
-            echo "Copying rootfs to partition..."
+            sudo mount "${loop}p${part_num}" "$mnt"
+            echo "Copying rootfs..."
             sudo cp -a "$rootfs_dir"/. "$mnt"/
             sudo umount "$mnt"
             sudo losetup -d "$loop"
             echo "Done: $part_name"
           }
 
-          # Append unenrolled ChromeOS partition
           append_rootfs data/rootfs_chromeos "chromeos"
-
-          # Clone for exam partition
           sudo cp -a data/rootfs_chromeos data/rootfs_chromeos_exam
           append_rootfs data/rootfs_chromeos_exam "chromeos_exam"
 
