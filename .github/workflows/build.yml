@@ -1,4 +1,4 @@
-name: Build Shimboot ChromeOS ye
+name: Build Shimboot ChromeOS
 
 on:
   workflow_dispatch:
